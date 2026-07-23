@@ -33,7 +33,7 @@ from analytics.quiz_metrics import (
 from analytics.response_analysis import compute_repeated_wrong_answers, compute_response_outcomes
 from analytics.summary import build_export_summary
 from analytics.syntax_analysis import compute_syntax_analysis
-from analytics.ui_theme import inject_global_styles
+from analytics.ui_theme import humanize_column_name, humanize_columns, inject_global_styles, pass_fail_scale, qualitative_colors
 from analytics.upload_cache import CACHE_HASH_FUNCS, clear_uploaded_files, get_uploader_key, sync_uploaded_files
 from analytics.validation import audit_question_data
 
@@ -83,7 +83,19 @@ st.set_page_config(
 )
 inject_global_styles()
 
-st.title("Question & Quiz Analysis")
+# Streamlit's own "⋮" menu (Deploy / theme / rerun, top-right) isn't extensible with
+# custom entries, so the closest available "top-right corner" is a right-aligned
+# toggle next to the page title.
+title_col, colorblind_col = st.columns([5, 2])
+with title_col:
+    st.title("Question & Quiz Analysis")
+with colorblind_col:
+    st.markdown("<div style='margin-top: 1.6rem;'></div>", unsafe_allow_html=True)
+    colorblind_mode = st.toggle(
+        "🎨 Colorblind Mode",
+        key="colorblind_mode",
+        help="Switches every chart (bars, box plots, scatter, line graphs, and the PRT pass-rate heatmap) to a red-green colorblind-safe palette.",
+    )
 st.warning("⏳ Depending on the size of your upload, it may take up to 30 seconds for all statistics to fully render, and up to 30 seconds for the downloadable PDF report to generate.")
 
 # Sidebar overflow fix: with 13 section checkboxes plus a quiz selector, the sidebar
@@ -129,7 +141,7 @@ if st.sidebar.button("🗑️ Clear / Reset All Uploaded Files", use_container_w
     st.cache_data.clear()
     st.rerun()
 
-anonymize_data = st.sidebar.checkbox("🔒 Anonymize Student Data", value=False)
+anonymize_data = st.sidebar.checkbox("🔒 Anonymize Student Data", value=True)
 
 
 @st.cache_data(show_spinner=False, hash_funcs=CACHE_HASH_FUNCS)
@@ -234,6 +246,7 @@ if show_quiz_summary:
         "Select Statistics to Display",
         ["student_count", "attempt_rate", "mean_grade", "grade_variance", "mean_highest_grade", "attempt_count"],
         default=["student_count", "attempt_rate", "mean_grade", "grade_variance", "mean_highest_grade", "attempt_count"],
+        format_func=humanize_column_name,
     )
 show_quiz_boxplot = st.sidebar.checkbox("10. Quiz Grade Distribution (Box Plot)")
 show_quiz_engagement = st.sidebar.checkbox("11. Engagement Over Time")
@@ -248,6 +261,7 @@ if show_quiz_linegraph:
         "Select Metrics to Display",
         ["student_count", "attempt_rate", "mean_grade", "grade_variance"],
         default=["student_count", "attempt_rate", "mean_grade", "grade_variance"],
+        format_func=humanize_column_name,
     )
 
 if uploaded_files:
@@ -353,8 +367,10 @@ if uploaded_files:
                         st.metric(label, value)
 
                 st.dataframe(
-                    question_metrics[["question", "attempts", "students", "avg_score", "percent_valid", "percent_invalid", "syntax_error_count"]]
-                    .rename(columns={"avg_score": "average_score"}),
+                    humanize_columns(
+                        question_metrics[["question", "attempts", "students", "avg_score", "percent_valid", "percent_invalid", "syntax_error_count"]]
+                        .rename(columns={"avg_score": "average_score"})
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -367,8 +383,8 @@ if uploaded_files:
                 st.caption("This section evaluates how difficult each question was and how effectively it separates stronger from weaker students (sourced from Best Attempt per Student).")
                 st.caption("⚠️ **Note on Discrimination (D)**: With small cohort sizes (around 30 students or fewer), the discrimination index is noisy and should be interpreted with caution.")
 
-                st.dataframe(ranked_difficulty.head(10), use_container_width=True, hide_index=True)
-                st.dataframe(difficulty_metrics, use_container_width=True, hide_index=True)
+                st.dataframe(humanize_columns(ranked_difficulty.head(10)), use_container_width=True, hide_index=True)
+                st.dataframe(humanize_columns(difficulty_metrics), use_container_width=True, hide_index=True)
 
                 col1, col2 = st.columns(2)
                 with col1:
@@ -377,7 +393,7 @@ if uploaded_files:
                         x="question",
                         y="avg_score",
                         color="question",
-                        color_discrete_sequence=px.colors.qualitative.Set2,
+                        color_discrete_sequence=qualitative_colors(colorblind_mode, px.colors.qualitative.Set2),
                         labels={"avg_score": "Average score", "question": "Question"},
                     )
                     fig.update_layout(title="Top Difficult Questions by Average Score", showlegend=False, template="plotly")
@@ -391,7 +407,7 @@ if uploaded_files:
                         x="question",
                         y="scaled_score",
                         color="question",
-                        color_discrete_sequence=px.colors.qualitative.Set2,
+                        color_discrete_sequence=qualitative_colors(colorblind_mode, px.colors.qualitative.Set2),
                         labels={"scaled_score": "Score (0-10)", "question": "Question"},
                     )
                     fig2.update_layout(title="Score Distribution by Question (Best Attempt per Student)", showlegend=False, template="plotly")
@@ -453,8 +469,8 @@ if uploaded_files:
                 st.caption("This section analyses how students answered each question, including common incorrect responses and potential misconceptions.")
                 if not has_prt_data:
                     st.info("Upload a Responses file as well to see PRT/answer-note analysis for this quiz.")
-                    st.dataframe(response_outcomes, use_container_width=True, hide_index=True)
-                    st.dataframe(valid_invalid, use_container_width=True, hide_index=True)
+                    st.dataframe(humanize_columns(response_outcomes), use_container_width=True, hide_index=True)
+                    st.dataframe(humanize_columns(valid_invalid), use_container_width=True, hide_index=True)
                 else:
                     col1, col2 = st.columns(2)
                     with col1:
@@ -463,7 +479,7 @@ if uploaded_files:
                             x="question",
                             y=["correct_percent", "incorrect_percent"],
                             barmode="group",
-                            color_discrete_sequence=px.colors.qualitative.Vivid,
+                            color_discrete_sequence=qualitative_colors(colorblind_mode, px.colors.qualitative.Vivid),
                             labels={"value": "Percent", "question": "Question"},
                         )
                         fig.update_layout(title="Response Outcome Percentages (Best Attempts)", template="plotly")
@@ -475,7 +491,7 @@ if uploaded_files:
                             x="question",
                             y=["Valid %", "Invalid/Syntax Error %"],
                             barmode="group",
-                            color_discrete_sequence=px.colors.qualitative.Vivid,
+                            color_discrete_sequence=qualitative_colors(colorblind_mode, px.colors.qualitative.Vivid),
                             labels={"value": "Percent", "question": "Question"},
                         )
                         fig2.update_layout(title="Valid vs Invalid Attempts (All Attempts)", template="plotly")
@@ -512,7 +528,7 @@ if uploaded_files:
                         fig3 = px.imshow(
                             heatmap_df,
                             labels=dict(x="PRT", y="Question", color="Pass %"),
-                            color_continuous_scale=["#ef4444", "#fde68a", "#22c55e"],
+                            color_continuous_scale=pass_fail_scale(colorblind_mode),
                         )
                         # Explicit tick labels so Plotly can't thin out categorical ticks it deems crowded.
                         fig3.update_xaxes(tickmode="array", tickvals=list(range(len(heatmap_df.columns))), ticktext=[str(c) for c in heatmap_df.columns])
@@ -529,7 +545,7 @@ if uploaded_files:
             with st.container(border=True):
                 st.subheader("5. Student Performance by Question")
                 st.caption("This section compares student performance across questions to identify patterns of understanding (Best Attempt per Student).")
-                st.dataframe(student_matrix, use_container_width=True)
+                st.dataframe(humanize_columns(student_matrix), use_container_width=True)
                 fig = px.imshow(student_matrix, labels=dict(x="Question", y="Student", color="Score"), color_continuous_scale="Viridis")
                 # Explicit tick labels on both axes so every question column and every
                 # student row stays visible instead of Plotly thinning crowded ticks.
@@ -547,7 +563,7 @@ if uploaded_files:
             with st.container(border=True):
                 st.subheader("6. Question Metrics")
                 st.caption("This section provides a consolidated numerical summary of every question-level metric and serves as the primary exportable dataset.")
-                st.dataframe(metrics_export, use_container_width=True, hide_index=True)
+                st.dataframe(humanize_columns(metrics_export), use_container_width=True, hide_index=True)
                 st.caption("⚠️ **Note on Discrimination (D)**: With small cohort sizes (around 30 students or fewer), the discrimination index is noisy and should be interpreted with caution.")
 
         # 7. Interpretation Notes Section
@@ -584,8 +600,8 @@ if uploaded_files:
             with st.container(border=True):
                 st.subheader("8. Merged List of Users and Files")
                 st.caption("Combines every uploaded quiz file into one view. Each row is one attempt, with the student, quiz, and date.")
-                st.dataframe(attempt_frame, use_container_width=True, hide_index=True)
-                quiz_merged_table = attempt_frame
+                quiz_merged_table = humanize_columns(attempt_frame)
+                st.dataframe(quiz_merged_table, use_container_width=True, hide_index=True)
 
         if show_quiz_summary:
             with st.container(border=True):
@@ -593,8 +609,8 @@ if uploaded_files:
                 st.caption("Aggregated statistics per quiz, combined across all uploaded files.")
                 if not attempt_frame.empty:
                     quiz_stats_df = compute_quiz_stats(attempt_frame, selected_quiz_stats)
-                    st.dataframe(quiz_stats_df, use_container_width=True, hide_index=True)
-                    quiz_summary_table = quiz_stats_df
+                    quiz_summary_table = humanize_columns(quiz_stats_df)
+                    st.dataframe(quiz_summary_table, use_container_width=True, hide_index=True)
                 else:
                     st.info("No quiz attempt data available yet.")
 
@@ -603,7 +619,7 @@ if uploaded_files:
                 st.subheader("10. Quiz Grade Distribution (Box Plot)")
                 st.caption("Spread of grades per quiz, with mean grade overlay, combined across all uploaded files.")
                 if not attempt_frame.empty:
-                    fig = build_boxplot_figure(attempt_frame)
+                    fig = build_boxplot_figure(attempt_frame, colorblind_mode=colorblind_mode)
                     fig.update_layout(template="plotly")
                     st.plotly_chart(fig, use_container_width=True, key="quiz_boxplot")
                     quiz_boxplot_fig = fig
@@ -615,7 +631,7 @@ if uploaded_files:
                 st.subheader("11. Engagement Over Time")
                 st.caption("Density of quiz attempt start times per quiz, combined across all uploaded files.")
                 if not attempt_frame.empty:
-                    fig = build_engagement_figure(attempt_frame)
+                    fig = build_engagement_figure(attempt_frame, colorblind_mode=colorblind_mode)
                     if fig is not None:
                         fig.update_layout(template="plotly")
                         st.plotly_chart(fig, use_container_width=True, key="quiz_engagement")
@@ -630,7 +646,7 @@ if uploaded_files:
                 st.subheader("12. Scatter Plot: Attempts vs Grades")
                 st.caption("Correlation between number of attempts and grade outcome, combined across all uploaded files.")
                 if not attempt_frame.empty:
-                    result = build_scatter_figure(attempt_frame, quiz_grade_type)
+                    result = build_scatter_figure(attempt_frame, quiz_grade_type, colorblind_mode=colorblind_mode)
                     if result is not None:
                         fig, correlation, y_label, _ = result
                         fig.update_layout(template="plotly")
@@ -647,7 +663,7 @@ if uploaded_files:
                 if not attempt_frame.empty:
                     if selected_quiz_metrics:
                         trend_data = build_metric_trend_data(attempt_frame, selected_quiz_metrics)
-                        fig = build_line_graph_figure(trend_data)
+                        fig = build_line_graph_figure(trend_data, colorblind_mode=colorblind_mode)
                         fig.update_layout(template="plotly")
                         st.plotly_chart(fig, use_container_width=True, key="quiz_linegraph")
                         quiz_linegraph_fig = fig
@@ -680,13 +696,13 @@ if uploaded_files:
             sections = [{
                 "title": f"{prefix}Question Summary",
                 "caption": "Participation and summary statistics",
-                "df": q_metrics[["question", "attempts", "students", "percent_valid", "percent_invalid", "syntax_error_count"]],
+                "df": humanize_columns(q_metrics[["question", "attempts", "students", "percent_valid", "percent_invalid", "syntax_error_count"]]),
             }]
 
             difficulty_charts = []
             fig = px.bar(
                 q_ranked_difficulty.head(10), x="question", y="avg_score", color="question",
-                color_discrete_sequence=px.colors.qualitative.Set2,
+                color_discrete_sequence=qualitative_colors(colorblind_mode, px.colors.qualitative.Set2),
                 labels={"avg_score": "Average score", "question": "Question"},
             )
             fig.update_layout(title="Top Difficult Questions by Average Score", showlegend=False, template="plotly")
@@ -694,7 +710,7 @@ if uploaded_files:
 
             fig2 = px.box(
                 q_pool_b, x="question", y="scaled_score", color="question",
-                color_discrete_sequence=px.colors.qualitative.Set2,
+                color_discrete_sequence=qualitative_colors(colorblind_mode, px.colors.qualitative.Set2),
                 labels={"scaled_score": "Score (0-10)", "question": "Question"},
             )
             fig2.update_layout(title="Score Distribution by Question (Best Attempt per Student)", showlegend=False, template="plotly")
@@ -703,14 +719,14 @@ if uploaded_files:
             sections.append({
                 "title": f"{prefix}Question Difficulty Analysis",
                 "caption": "Facility and discrimination (Best Attempt)",
-                "df": q_difficulty,
+                "df": humanize_columns(q_difficulty),
                 "charts": difficulty_charts,
             })
 
             sections.append({
                 "title": f"{prefix}Question Response Distribution",
                 "caption": "Response outcomes and top wrong answers",
-                "df": q_response_outcomes.merge(q_repeated_wrong.drop(columns=["top_wrong_expressions"], errors="ignore"), on="question", how="left"),
+                "df": humanize_columns(q_response_outcomes.merge(q_repeated_wrong.drop(columns=["top_wrong_expressions"], errors="ignore"), on="question", how="left")),
             })
 
             student_matrix_q = q_pool_b.pivot_table(
@@ -720,18 +736,55 @@ if uploaded_files:
             sections.append({
                 "title": f"{prefix}Student Performance Matrix",
                 "caption": "Per-student score per question (Best Attempt)",
-                "df": student_matrix_q.reset_index(),
+                "df": humanize_columns(student_matrix_q.reset_index()),
             })
 
             return sections
 
         # PDF Report Options — scoped to PDF generation only; the on-screen sections
-        # above are unaffected by these controls.
+        # above are unaffected by these controls. Only sections currently enabled
+        # on-screen (via the sidebar checkboxes) are offered here, since their
+        # underlying tables/charts are only computed when that toggle is on.
+        question_section_options = [
+            (show_summary, "1. Question Summary"),
+            (show_difficulty, "2. Question Difficulty Analysis"),
+            (show_item_details, "3. Question Item Details & Error Drill-Down"),
+            (show_response, "4. Question Response Distribution"),
+            (show_student, "5. Student Performance Matrix"),
+            (show_metrics, "6. Question Metrics"),
+        ]
+        available_question_sections = [label for enabled, label in question_section_options if enabled]
+
+        quiz_section_options = [
+            (show_quiz_merged, "8. Merged List of Users and Files"),
+            (show_quiz_summary, "9. Summary of Quiz Stats"),
+            (show_quiz_boxplot, "10. Quiz Grade Distribution (Box Plot)"),
+            (show_quiz_engagement, "11. Engagement Over Time"),
+            (show_quiz_scatter, "12. Scatter Plot: Attempts vs Grades"),
+            (show_quiz_linegraph, "13. Line Graph of Various Metrics"),
+        ]
+        available_quiz_sections = [label for enabled, label in quiz_section_options if enabled]
+
         st.markdown("<br>", unsafe_allow_html=True)
         with st.container(border=True):
             st.markdown("### 📄 PDF Report Options")
             pdf_include_quiz_summary = st.checkbox("Include Quiz Analysis Summary", value=True)
+            pdf_selected_quiz_sections = available_quiz_sections
+            if pdf_include_quiz_summary and available_quiz_sections:
+                pdf_selected_quiz_sections = st.multiselect(
+                    "Select which Quiz Analysis sections to include",
+                    options=available_quiz_sections,
+                    default=available_quiz_sections,
+                )
+
             pdf_include_question_breakdown = st.checkbox("Include Question Analysis Breakdown", value=True)
+            pdf_selected_question_sections = available_question_sections
+            if pdf_include_question_breakdown and available_question_sections:
+                pdf_selected_question_sections = st.multiselect(
+                    "Select which Question Analysis sections to include",
+                    options=available_question_sections,
+                    default=available_question_sections,
+                )
 
             pdf_selected_quizzes = [selected_quiz_name]
             if pdf_include_question_breakdown and len(quiz_names) > 1:
@@ -746,19 +799,19 @@ if uploaded_files:
         # plus the PDF-only scope controls above.
         pdf_sections = []
         if pdf_include_question_breakdown:
-            if show_summary:
-                pdf_sections.append({"title": "1. Question Summary", "caption": f"Participation and summary statistics ({selected_quiz_name})", "df": question_metrics[["question", "attempts", "students", "percent_valid", "percent_invalid", "syntax_error_count"]]})
-            if show_difficulty:
-                pdf_sections.append({"title": "2. Question Difficulty Analysis", "caption": "Facility and discrimination (Best Attempt)", "df": difficulty_metrics, "charts": difficulty_section_charts})
-            if show_item_details:
-                pdf_sections.append({"title": "3. Question Item Details & Error Drill-Down", "caption": "Question text, right answer, and wrong-response drill-down (Best Attempt)", "df": item_details_pdf_table})
-            if show_response:
+            if show_summary and "1. Question Summary" in pdf_selected_question_sections:
+                pdf_sections.append({"title": "1. Question Summary", "caption": f"Participation and summary statistics ({selected_quiz_name})", "df": humanize_columns(question_metrics[["question", "attempts", "students", "percent_valid", "percent_invalid", "syntax_error_count"]])})
+            if show_difficulty and "2. Question Difficulty Analysis" in pdf_selected_question_sections:
+                pdf_sections.append({"title": "2. Question Difficulty Analysis", "caption": "Facility and discrimination (Best Attempt)", "df": humanize_columns(difficulty_metrics), "charts": difficulty_section_charts})
+            if show_item_details and "3. Question Item Details & Error Drill-Down" in pdf_selected_question_sections:
+                pdf_sections.append({"title": "3. Question Item Details & Error Drill-Down", "caption": "Question text, right answer, and wrong-response drill-down (Best Attempt)", "df": humanize_columns(item_details_pdf_table)})
+            if show_response and "4. Question Response Distribution" in pdf_selected_question_sections:
                 repeated_wrong_answers_pdf = repeated_wrong_answers.drop(columns=["top_wrong_expressions"], errors="ignore")
-                pdf_sections.append({"title": "4. Question Response Distribution", "caption": "Response outcomes and top wrong answers", "df": response_outcomes.merge(repeated_wrong_answers_pdf, on="question", how="left"), "charts": response_section_charts})
-            if show_student:
-                pdf_sections.append({"title": "5. Student Performance Matrix", "caption": "Per-student score per question (Best Attempt)", "df": student_matrix.reset_index(), "charts": student_section_charts})
-            if show_metrics:
-                pdf_sections.append({"title": "6. Question Metrics", "caption": "Consolidated question analytics table", "df": metrics_export})
+                pdf_sections.append({"title": "4. Question Response Distribution", "caption": "Response outcomes and top wrong answers", "df": humanize_columns(response_outcomes.merge(repeated_wrong_answers_pdf, on="question", how="left")), "charts": response_section_charts})
+            if show_student and "5. Student Performance Matrix" in pdf_selected_question_sections:
+                pdf_sections.append({"title": "5. Student Performance Matrix", "caption": "Per-student score per question (Best Attempt)", "df": humanize_columns(student_matrix.reset_index()), "charts": student_section_charts})
+            if show_metrics and "6. Question Metrics" in pdf_selected_question_sections:
+                pdf_sections.append({"title": "6. Question Metrics", "caption": "Consolidated question analytics table", "df": humanize_columns(metrics_export)})
 
             for extra_quiz in pdf_selected_quizzes:
                 if extra_quiz == selected_quiz_name:
@@ -766,17 +819,17 @@ if uploaded_files:
                 pdf_sections.extend(_build_question_pdf_sections(extra_quiz))
 
         if pdf_include_quiz_summary:
-            if show_quiz_merged and quiz_merged_table is not None:
+            if show_quiz_merged and quiz_merged_table is not None and "8. Merged List of Users and Files" in pdf_selected_quiz_sections:
                 pdf_sections.append({"title": "8. Merged List of Users and Files", "caption": "All parsed quiz attempt rows (combined across uploaded files)", "df": quiz_merged_table})
-            if show_quiz_summary and quiz_summary_table is not None:
+            if show_quiz_summary and quiz_summary_table is not None and "9. Summary of Quiz Stats" in pdf_selected_quiz_sections:
                 pdf_sections.append({"title": "9. Summary of Quiz Stats", "caption": "Aggregated stats per quiz", "df": quiz_summary_table})
-            if show_quiz_boxplot and quiz_boxplot_fig is not None:
+            if show_quiz_boxplot and quiz_boxplot_fig is not None and "10. Quiz Grade Distribution (Box Plot)" in pdf_selected_quiz_sections:
                 pdf_sections.append({"title": "10. Quiz Grade Distribution (Box Plot)", "caption": "Spread of grades per quiz, with mean grade overlay", "charts": [{"title": "Grade Distribution", "figure": quiz_boxplot_fig}]})
-            if show_quiz_engagement and quiz_engagement_fig is not None:
+            if show_quiz_engagement and quiz_engagement_fig is not None and "11. Engagement Over Time" in pdf_selected_quiz_sections:
                 pdf_sections.append({"title": "11. Engagement Over Time", "caption": "Density of quiz attempt start times per quiz", "charts": [{"title": "Engagement Over Time", "figure": quiz_engagement_fig}]})
-            if show_quiz_scatter and quiz_scatter_fig is not None:
+            if show_quiz_scatter and quiz_scatter_fig is not None and "12. Scatter Plot: Attempts vs Grades" in pdf_selected_quiz_sections:
                 pdf_sections.append({"title": "12. Scatter Plot: Attempts vs Grades", "caption": "Correlation between number of attempts and grade outcome", "charts": [{"title": "Attempts vs Grades", "figure": quiz_scatter_fig}]})
-            if show_quiz_linegraph and quiz_linegraph_fig is not None:
+            if show_quiz_linegraph and quiz_linegraph_fig is not None and "13. Line Graph of Various Metrics" in pdf_selected_quiz_sections:
                 pdf_sections.append({"title": "13. Line Graph of Various Metrics", "caption": "Trend of selected metrics across quizzes", "charts": [{"title": "Metrics by Quiz", "figure": quiz_linegraph_fig}]})
 
         pdf_bytes = generate_pdf_report(
