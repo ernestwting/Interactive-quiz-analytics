@@ -1,18 +1,58 @@
 from __future__ import annotations
 
+import functools
 import io
+import logging
 import os
+import re
 import tempfile
 from typing import Any
 import pandas as pd
 import plotly.io as pio
+from matplotlib.font_manager import FontProperties
+from matplotlib.mathtext import math_to_image
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
-from reportlab.platypus import Image, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus.tableofcontents import TableOfContents
+
+_logger = logging.getLogger(__name__)
+
+_chrome_bootstrap_attempted = False
+
+
+def _is_chrome_not_found(exc: Exception) -> bool:
+    """kaleido >= 1.0 renders via a real headless Chrome instead of a bundled
+    Chromium, and raises this specific error when none is discoverable on the host
+    (e.g. a bare Streamlit Community Cloud container with no `chromium` apt package
+    installed) — distinguishing it from other rasterization failures lets us attempt
+    a one-time self-heal (_ensure_chrome_available) instead of just giving up."""
+    try:
+        from choreographer.errors import ChromeNotFoundError
+        return isinstance(exc, ChromeNotFoundError)
+    except Exception:
+        return "chrome" in str(exc).lower() and "not" in str(exc).lower()
+
+
+def _ensure_chrome_available() -> None:
+    """One-time, best-effort attempt to download a private headless Chrome for
+    kaleido when no system Chrome/Chromium was found. Safe to call repeatedly —
+    only actually attempts the download once per process, and swallows failures
+    (e.g. no outbound network access) since the caller already has a graceful
+    fallback (the PDF simply notes the chart image is unavailable)."""
+    global _chrome_bootstrap_attempted
+    if _chrome_bootstrap_attempted:
+        return
+    _chrome_bootstrap_attempted = True
+    try:
+        import kaleido
+        kaleido.get_chrome_sync()
+    except Exception:
+        _logger.warning("Could not download a private Chrome for kaleido chart export.", exc_info=True)
 
 
 def _prepare_plotly_export(figure: Any) -> tuple[Any, int, int] | None:
@@ -34,8 +74,11 @@ def _prepare_plotly_export(figure: Any) -> tuple[Any, int, int] | None:
         cloned = figure.__class__(figure)
         cloned.update_layout(
             template="plotly",
-            margin=dict(l=50, r=50, t=50, b=80),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5),
+            # Bottom margin is generous enough for a 2-line wrapped x-axis category
+            # label (e.g. the line graph's wrapped quiz names) plus the axis title
+            # and the horizontal legend below it, without any of the three overlapping.
+            margin=dict(l=50, r=50, t=50, b=110),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.4, xanchor="center", x=0.5),
         )
         # Respect a figure's own explicit size (e.g. the student-performance heatmap
         # scales its height to the student count) instead of overriding it.
@@ -76,8 +119,8 @@ def _batch_rasterize_plotly_charts(sections: list[dict[str, Any]]) -> dict[int, 
     if not jobs:
         return {}
 
-    results: dict[int, bytes] = {}
-    try:
+    def _run_batch() -> dict[int, bytes]:
+        batch_results: dict[int, bytes] = {}
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = [os.path.join(tmpdir, f"chart_{i}.png") for i in range(len(jobs))]
             pio.write_images(
@@ -92,10 +135,21 @@ def _batch_rasterize_plotly_charts(sections: list[dict[str, Any]]) -> dict[int, 
                 with open(path, "rb") as f:
                     data = f.read()
                 if data:
-                    results[original_id] = data
-    except Exception:
-        pass  # Leave results empty; _figure_to_png_bytes below re-tries per chart.
-    return results
+                    batch_results[original_id] = data
+        return batch_results
+
+    try:
+        return _run_batch()
+    except Exception as exc:
+        if _is_chrome_not_found(exc):
+            _ensure_chrome_available()
+            try:
+                return _run_batch()
+            except Exception:
+                _logger.warning("Batch chart rasterization failed after Chrome bootstrap retry.", exc_info=True)
+        else:
+            _logger.warning("Batch chart rasterization failed.", exc_info=True)
+        return {}  # Leave results empty; _figure_to_png_bytes below re-tries per chart.
 
 
 def _figure_to_png_bytes(figure: Any) -> bytes | None:
@@ -111,19 +165,235 @@ def _figure_to_png_bytes(figure: Any) -> bytes | None:
         return None
     if isinstance(figure, (bytes, bytearray)):
         return bytes(figure)
-    try:
-        prepared = _prepare_plotly_export(figure)
-        if prepared is not None:
-            fig, w, h = prepared
+
+    prepared = _prepare_plotly_export(figure)
+    if prepared is not None:
+        fig, w, h = prepared
+        try:
             return fig.to_image(format="png", width=w, height=h, scale=2)
-        if hasattr(figure, "savefig"):  # Matplotlib Figure
+        except Exception as exc:
+            if _is_chrome_not_found(exc):
+                _ensure_chrome_available()
+                try:
+                    return fig.to_image(format="png", width=w, height=h, scale=2)
+                except Exception:
+                    _logger.warning("Chart rasterization failed after Chrome bootstrap retry.", exc_info=True)
+                    return None
+            _logger.warning("Chart rasterization failed.", exc_info=True)
+            return None
+
+    if hasattr(figure, "savefig"):  # Matplotlib Figure
+        try:
             buf = io.BytesIO()
             figure.savefig(buf, format="png", dpi=150, bbox_inches="tight")
             buf.seek(0)
             return buf.getvalue()
+        except Exception:
+            _logger.warning("Matplotlib figure rasterization failed.", exc_info=True)
+            return None
+    return None
+
+
+_MATH_DPI = 300
+_MATH_PT_PER_PX = 72.0 / _MATH_DPI  # dpi is an exact px<->pt conversion, so every
+# fragment rendered at the same requested font size comes back at the same physical
+# size once converted back through this factor — normalizing to each fragment's own
+# (glyph-shape-dependent) bounding-box height instead would make e.g. a plain "3/4"
+# look bigger than a "sqrt(3)*i" answer rendered right next to it at the "same" size.
+
+
+@functools.lru_cache(maxsize=4096)
+def _render_math_png(fragment: str, fontsize: float) -> bytes | None:
+    """Rasterize one line of text via Matplotlib's mathtext, which — unlike a plain
+    reportlab Paragraph — natively supports mixed text/math strings (only the
+    portions wrapped in `$...$` are typeset as math), so STACK answer expressions
+    like `ans1: $-1/8$` render as actual fractions instead of literal dollar signs
+    and backslash commands. Cached since the same right-answer/expression string
+    repeats across many student rows in the drill-down tables.
+    """
+    if not fragment.strip():
+        return None
+    try:
+        buf = io.BytesIO()
+        math_to_image(fragment, buf, prop=FontProperties(size=fontsize), dpi=_MATH_DPI, color="#0f172a")
+        return buf.getvalue()
     except Exception:
         return None
-    return None
+
+
+_LONG_FRAGMENT_THRESHOLD = 42
+_MATH_SPAN_RE = re.compile(r"^(.*?)\$(.*)\$(.*)$", re.DOTALL)
+
+
+def _wrap_long_math_fragment(fragment: str) -> list[str]:
+    """A single `ansN: $...$` fragment can still be too wide to render at a legible
+    size even after splitting on `; ` — e.g. a two-term trig identity like
+    `9*i*sin(...)+9*cos(...)` — and since every fragment in a column shares one
+    shrink factor (`_build_math_table_rows`), one such outlier drags down the whole
+    column's font size. Break it at its top-level `+`/`-` (outside parens) onto
+    additional lines, same as a human would wrap a long formula by hand, so the
+    widest fragment in the column shrinks and the rest of the column can stay larger.
+    """
+    if len(fragment) <= _LONG_FRAGMENT_THRESHOLD or "$" not in fragment:
+        return [fragment]
+    match = _MATH_SPAN_RE.match(fragment)
+    if not match or match.group(3).strip():
+        return [fragment]
+    prefix, inner, _ = match.groups()
+
+    depth = 0
+    split_points = []
+    for i, ch in enumerate(inner):
+        if ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth -= 1
+        elif ch in "+-" and depth == 0 and i > 0:
+            split_points.append(i)
+    if not split_points:
+        return [fragment]
+
+    parts = []
+    start = 0
+    for sp in split_points:
+        parts.append(inner[start:sp])
+        start = sp
+    parts.append(inner[start:])
+    return [f"{prefix if idx == 0 else ''}${part.strip()}$" for idx, part in enumerate(parts) if part.strip()]
+
+
+def _split_math_fragments(text: str) -> list[str]:
+    """Split cell text on newlines and on `; ` (the separator this codebase already
+    uses between `ansN: ...` groups), so a long multi-answer cell stacks as several
+    rasterized lines instead of being squeezed into one oversized, illegible image.
+    Any fragment still too long gets further wrapped (see `_wrap_long_math_fragment`).
+    """
+    fragments = []
+    for line in text.split("\n"):
+        for fragment in line.split("; "):
+            fragment = fragment.strip()
+            if fragment:
+                fragments.extend(_wrap_long_math_fragment(fragment))
+    return fragments
+
+
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    idx = int(round(pct * (len(sorted_values) - 1)))
+    return sorted_values[idx]
+
+
+def _build_math_table_rows(text_grid: list[list[str]], style: ParagraphStyle, col_widths: list[float]) -> list[list[Any]]:
+    """Build reportlab table cell content for a whole df at once (rather than cell by
+    cell), so that every math fragment in a given column shares one baseline
+    shrink-to-fit factor instead of being scaled independently — the original
+    per-cell approach made an `ans1: $-1/8$` cell look bigger than an
+    `ans1: $9 \\cdot \\sin(...)$` cell right next to it, and even made `ans1`/`ans2`
+    within the *same* cell inconsistent.
+
+    The baseline is sized to the column's 90th-percentile fragment width, not its
+    single widest one: basing it on the max meant one long outlier (e.g. a trig
+    identity a few rows down) shrank every other, much shorter answer in the same
+    column too. A fragment that still doesn't fit at the shared baseline (i.e. it's
+    in that top decile) gets an extra, individual shrink on top — so the common case
+    renders as large as the column comfortably allows, and only genuine outliers
+    end up smaller.
+
+    Cells with no `$...$` math pass through as a single Paragraph, unchanged from
+    before. A fragment that fails to rasterize (e.g. an unsupported construct) falls
+    back to plain Paragraph text rather than dropping the cell's content.
+    """
+    fontsize = style.fontSize * 1.35
+    col_count = len(col_widths)
+
+    # Pass 1: rasterize every math fragment once (cached across repeats — the same
+    # right-answer string recurs across many student rows) and collect, per column,
+    # every fragment's natural (unshrunk) rendered width.
+    cell_items: list[list[list[tuple[str, Any]]]] = []
+    col_natural_widths: list[list[float]] = [[] for _ in range(col_count)]
+    for row in text_grid:
+        row_items = []
+        for col_idx, val in enumerate(row):
+            if not val:
+                row_items.append([("text", "")])
+                continue
+            if "$" not in val:
+                row_items.append([("text", val)])
+                continue
+            items: list[tuple[str, Any]] = []
+            for fragment in _split_math_fragments(val):
+                png_bytes = _render_math_png(fragment, fontsize)
+                if not png_bytes:
+                    items.append(("text", fragment))
+                    continue
+                reader = ImageReader(io.BytesIO(png_bytes))
+                img_w, img_h = reader.getSize()
+                draw_w, draw_h = img_w * _MATH_PT_PER_PX, img_h * _MATH_PT_PER_PX
+                col_natural_widths[col_idx].append(draw_w)
+                items.append(("math", (png_bytes, draw_w, draw_h)))
+            row_items.append(items or [("text", "")])
+        cell_items.append(row_items)
+
+    col_baseline_shrink = []
+    for c in range(col_count):
+        widths = sorted(col_natural_widths[c])
+        baseline_width = _percentile(widths, 0.9)
+        col_baseline_shrink.append(col_widths[c] / baseline_width if baseline_width > col_widths[c] else 1.0)
+
+    # Pass 2: build the final flowables. Each fragment gets its column's shared
+    # baseline shrink, plus an extra individual shrink only if it still overflows
+    # the column at that baseline (the top decile of outliers).
+    table_rows: list[list[Any]] = []
+    for row_items in cell_items:
+        row_cells = []
+        for col_idx, items in enumerate(row_items):
+            baseline_shrink = col_baseline_shrink[col_idx]
+            max_width = col_widths[col_idx]
+            flowables: list[Any] = []
+            for kind, payload in items:
+                if kind == "text":
+                    flowables.append(Paragraph(payload, style))
+                else:
+                    png_bytes, draw_w, draw_h = payload
+                    draw_w, draw_h = draw_w * baseline_shrink, draw_h * baseline_shrink
+                    if draw_w > max_width:
+                        extra_shrink = max_width / draw_w
+                        draw_w, draw_h = draw_w * extra_shrink, draw_h * extra_shrink
+                    flowables.append(Image(io.BytesIO(png_bytes), width=draw_w, height=draw_h))
+            row_cells.append(flowables)
+        table_rows.append(row_cells)
+    return table_rows
+
+
+_NARROW_COLUMN_WEIGHTS = {
+    "question": 0.55,
+    "score": 0.45,
+    "status": 0.6,
+    "student name": 0.85,
+    "frequency": 0.5,
+}
+_WIDE_COLUMN_KEYWORDS = ("response", "answer", "text", "email")
+
+
+def _compute_column_widths(columns: list[str], usable_width: float) -> list[float]:
+    """Weight columns by how much horizontal room their content actually needs,
+    instead of splitting the page evenly — short fixed-vocabulary columns (Question,
+    Score, Status, Student Name) get a smaller share so the free-text/math columns
+    (Submitted Response, Right Answer, Most Common Incorrect Answer, ...) get more
+    room and don't need to shrink their rendered math as aggressively.
+    """
+    weights = []
+    for col in columns:
+        key = str(col).strip().lower()
+        if key in _NARROW_COLUMN_WEIGHTS:
+            weights.append(_NARROW_COLUMN_WEIGHTS[key])
+        elif any(keyword in key for keyword in _WIDE_COLUMN_KEYWORDS):
+            weights.append(1.6)
+        else:
+            weights.append(1.0)
+    total_weight = sum(weights) or 1.0
+    return [usable_width * w / total_weight for w in weights]
 
 
 class NumberedCanvas(canvas.Canvas):
@@ -164,6 +434,24 @@ class NumberedCanvas(canvas.Canvas):
         self.restoreState()
 
 
+class _ReportDocTemplate(SimpleDocTemplate):
+    """Feeds every section heading to the `TableOfContents` flowable and the PDF's
+    native outline/bookmarks panel as it's laid out. Reportlab can't know a heading's
+    page number until layout actually reaches it, so the auto-generated TOC (added at
+    the front of the story) necessarily lags a build behind — `multiBuild` (used
+    instead of `build` below) re-runs the layout until the TOC stops changing, which
+    is reportlab's standard recipe for a self-populating table of contents.
+    """
+
+    def afterFlowable(self, flowable: Any) -> None:
+        if isinstance(flowable, Paragraph) and getattr(flowable, "style", None) is not None and flowable.style.name == "SectionHeading":
+            text = flowable.getPlainText()
+            self.notify("TOCEntry", (0, text, self.page))
+            key = f"section-{id(flowable)}"
+            self.canv.bookmarkPage(key)
+            self.canv.addOutlineEntry(text, key, level=0, closed=True)
+
+
 def generate_pdf_report(
     title: str,
     subtitle: str,
@@ -181,7 +469,7 @@ def generate_pdf_report(
       }
     """
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
+    doc = _ReportDocTemplate(
         buffer,
         pagesize=letter,
         leftMargin=54,
@@ -261,12 +549,42 @@ def generate_pdf_report(
         spaceAfter=4,
     )
 
+    toc_heading_style = ParagraphStyle(
+        "TOCHeading",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=14,
+        leading=17,
+        textColor=colors.HexColor("#1e3c72"),
+        spaceAfter=10,
+    )
+
     story: list[Any] = []
 
     # Document Header
     story.append(Paragraph(title, title_style))
     story.append(Paragraph(subtitle, subtitle_style))
     story.append(Spacer(1, 8))
+
+    # Table of Contents — only worth the page when there's more than a couple of
+    # sections to navigate; auto-populated by _ReportDocTemplate.afterFlowable as
+    # layout reaches each "SectionHeading" (a distinct, non-"SectionHeading" style
+    # here keeps this heading itself out of its own listing).
+    if len(sections) > 2:
+        toc = TableOfContents()
+        toc.levelStyles = [
+            ParagraphStyle(
+                "TOCEntry",
+                parent=styles["Normal"],
+                fontName="Helvetica",
+                fontSize=10,
+                leading=14,
+                textColor=colors.HexColor("#1e293b"),
+            ),
+        ]
+        story.append(Paragraph("Table of Contents", toc_heading_style))
+        story.append(toc)
+        story.append(PageBreak())
 
     usable_width = letter[0] - 108  # 504 pt
 
@@ -289,25 +607,21 @@ def generate_pdf_report(
             header_elements.append(Paragraph(sec_caption, caption_style))
 
         if isinstance(df, pd.DataFrame) and not df.empty:
-            table_data = []
+            col_widths = _compute_column_widths(list(df.columns), usable_width)
+            # Default reportlab cell padding is 6pt each on left/right; give the math
+            # rasterizer a little less than the raw column width so it shrinks to fit
+            # inside the cell instead of touching the grid lines.
+            cell_content_widths = [max(w - 12, 10) for w in col_widths]
 
             # Format headers
             headers = [Paragraph(str(col), header_cell_style) for col in df.columns]
-            table_data.append(headers)
 
             # Data rows
             df_slice = df.head(60)
-            for _, r in df_slice.iterrows():
-                row_cells = []
-                for val in r:
-                    val_str = str(val) if pd.notna(val) else ""
-                    row_cells.append(Paragraph(val_str, cell_style))
-                table_data.append(row_cells)
+            text_grid = [[str(v) if pd.notna(v) else "" for v in r] for _, r in df_slice.iterrows()]
+            table_data = [headers] + _build_math_table_rows(text_grid, cell_style, cell_content_widths)
 
-            col_count = len(df.columns)
-            col_width = usable_width / max(1, col_count)
-
-            t = Table(table_data, colWidths=[col_width] * col_count)
+            t = Table(table_data, colWidths=col_widths)
             t.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e3c72")),
                 ("ALIGN", (0, 0), (-1, -1), "LEFT"),
@@ -333,7 +647,7 @@ def generate_pdf_report(
             png_bytes = chart_png_cache.get(id(chart_source)) or _figure_to_png_bytes(chart_source)
             if not png_bytes:
                 if chart_title:
-                    story.append(Paragraph(f"{chart_title} — chart image unavailable (kaleido not installed).", note_style))
+                    story.append(Paragraph(f"{chart_title} — chart image unavailable (rendering failed; check the app logs for details).", note_style))
                 continue
 
             chart_elements: list[Any] = []
@@ -359,5 +673,5 @@ def generate_pdf_report(
 
         story.append(Spacer(1, 12))
 
-    doc.build(story, canvasmaker=NumberedCanvas)
+    doc.multiBuild(story, canvasmaker=NumberedCanvas)
     return buffer.getvalue()
