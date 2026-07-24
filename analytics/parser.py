@@ -54,6 +54,45 @@ def _resolve_student_identity(row: "pd.Series", index: int) -> tuple[str, str]:
     return str(student_id), student_name
 
 
+# Canonical Moodle export header -> alternate names seen from other export
+# configurations/languages/plugins (e.g. a "Username" column instead of "Email
+# address", "Status" instead of "State"). Keys are matched case-insensitively
+# and only used to fill in a canonical column that isn't already present, so a
+# real "Email address" column always wins over a "Username" alias.
+_COLUMN_ALIASES: dict[str, list[str]] = {
+    "Email address": ["email address", "email", "e-mail", "e-mail address", "username", "user name"],
+    "First name": ["first name", "given name", "firstname"],
+    "Surname": ["surname", "last name", "lastname", "family name"],
+    "State": ["state", "status"],
+    "Started on": ["started on", "started", "start time", "time started"],
+    "Completed": ["completed", "completion time", "time completed", "end time"],
+    "Time taken": ["time taken", "duration"],
+}
+
+
+def _normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename columns to their canonical name whenever a recognized alias is used
+    instead (e.g. a Moodle site/plugin exporting "Username"/"Status" rather than
+    "Email address"/"State"), so every downstream function can keep relying on one
+    fixed set of header names regardless of which export produced the file."""
+    existing_lower = {str(col).strip().lower() for col in df.columns}
+    rename_map: dict[str, str] = {}
+
+    for canonical, aliases in _COLUMN_ALIASES.items():
+        if canonical.lower() in existing_lower:
+            continue
+        for col in df.columns:
+            if col in rename_map:
+                continue
+            if str(col).strip().lower() in aliases:
+                rename_map[col] = canonical
+                break
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
 def _clean_html_text(text: Any) -> str:
     """Strip HTML tags/entities from a Moodle question/answer cell, leaving LaTeX delimiters intact."""
     if pd.isna(text):
@@ -75,12 +114,7 @@ def parse_uploaded_file(file_obj: Any) -> pd.DataFrame:
         raise ValueError(f"Unsupported file format: {file_obj.name}")
 
     df = _fix_mojibake_df(df)
-
-    if "Last name" in df.columns:
-        df = df.rename(columns={"Last name": "Surname"})
-
-    if "State" in df.columns and "state" not in df.columns:
-        df = df.rename(columns={"State": "State"})
+    df = _normalize_column_names(df)
 
     return df
 
@@ -129,11 +163,15 @@ def parse_response_cell(cell_text: str) -> tuple[list[dict[str, Any]], list[dict
             "tag": m.group(3)
         })
 
-    # 2. Parse prt fields: prtK: ! OR prtK: # = fraction | note1 | note2...
-    prt_matches = re.finditer(r"prt(\d+):\s*(!|# = ([0-9.]+))(?:\s*\|\s*([^;]*))?", cell_text)
+    # 2. Parse PRT fields: <name>: ! OR <name>: # = fraction | note1 | note2...
+    # PRT names are author-defined in STACK (default "prt1"/"prt2", but Moodle exports
+    # commonly show custom names like "Result"/"Result2" instead) — matching depends on
+    # the "!" / "# = fraction" value shape, not on any literal "prt" prefix or embedded
+    # digit, so an index is assigned by order of appearance rather than parsed from the
+    # name (many custom names, e.g. "Result", carry no digit at all).
+    prt_matches = re.finditer(r"(\w+):\s*(!|# = ([0-9.]+))(?:\s*\|\s*([^;]*))?", cell_text)
     prt_list = []
-    for m in prt_matches:
-        idx = int(m.group(1))
+    for idx, m in enumerate(prt_matches, start=1):
         val = m.group(2)
         fraction = None
         answer_note = "(invalid/blank input)"
